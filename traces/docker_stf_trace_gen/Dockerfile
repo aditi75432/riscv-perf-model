@@ -1,97 +1,145 @@
 FROM ubuntu:24.04
 
-# Combine apt-get commands and clean up to reduce image size
-RUN apt-get update && apt-get install -y \
-    device-tree-compiler \
-    libboost-regex-dev \
-    libboost-system-dev \
-    libboost-program-options-dev \
-    libboost-json-dev \
-    rapidjson-dev \
-    libhdf5-dev \
-    liblzma-dev \
-    libbz2-dev \
-    cython3 \
-    git \
-    binutils \
-    build-essential \
-    cmake \
-    gcc-riscv64-linux-gnu \
-    zstd \
-    libzstd-dev \
+# Set environment variables early
+ENV RISCV=/riscv
+ENV QEMU_DIR=/qemu
+ENV QEMU_PLUGINS=/qemu/build/contrib/plugins
+ENV PATH=$RISCV/bin:/opt/riscv/riscv32-elf/bin:/opt/riscv/riscv64-elf/bin:/opt/riscv/riscv32-glibc/bin:/SimPoint/bin:/qemu/build:$PATH 
+ENV DEBIAN_FRONTEND=noninteractive
+ENV WORKDIR=/workspace
+ENV WORKLOADS=/workloads
+ENV OUTPUT=/output
+
+# Install dependencies and clean up in one layer
+RUN apt update && apt install -y \
     autoconf \
     automake \
     autotools-dev \
+    bc \
+    binutils \
+    bison \
+    build-essential \
+    cmake \
     curl \
+    cython3 \
+    device-tree-compiler \
+    flex \
+    gawk \
+    gcc-riscv64-linux-gnu \
+    gperf \
+    git \
+    jq \
+    libboost-json-dev \
+    libboost-program-options-dev \
+    libboost-regex-dev \
+    libboost-system-dev \
+    libbz2-dev \
+    libexpat-dev \
+    libglib2.0-dev \
+    libgmp-dev \
+    libhdf5-dev \
+    liblzma-dev \
+    libmpc-dev \
+    libmpfr-dev \
+    libslirp-dev \
+    libtool \
+    libzstd-dev \
+    ninja-build \
+    patchutils \
     python3 \
     python3-pip \
     python3-tomli \
-    libmpc-dev \
-    libmpfr-dev \
-    libgmp-dev \
-    gawk \
-    bison \
-    flex \
+    rapidjson-dev \
     texinfo \
-    gperf \
-    libtool \
-    patchutils \
-    bc \
-    zlib1g-dev \
-    libexpat-dev \
-    ninja-build \
-    libglib2.0-dev \
-    libslirp-dev \
     wget \
-    && rm -rf /var/lib/apt/lists/*
+    zlib1g-dev \
+    zstd \
+    python3-yaml
 
-# Set up RISCV environment
-ENV RISCV=/riscv
-ENV PATH=$RISCV/bin:/opt/riscv/bin:$PATH
-RUN mkdir -p $RISCV
-
-# Using HTTP instead of SSH to avoid setting git credentials
-RUN git config --global url."https://github.com/".insteadOf "git@github.com:"
-
-# Generic config details required during the cloning (git am, apply,patch done during the toolchain build process)
-RUN git config --global user.email "builder@example.com" && \
+# Configure git for building
+RUN git config --global url."https://github.com/".insteadOf "git@github.com:" && \
+    git config --global user.email "builder@docker.com" && \
     git config --global user.name "Docker Builder"
 
+# Create directory structure
+RUN mkdir -p /output
 
-# Clone repositories
+# Clone repositories in RISCV directory
 WORKDIR $RISCV
-RUN git clone https://github.com/condorcomputing/condor.riscv-isa-sim.git --recurse-submodules || exit 1
-RUN git clone https://github.com/sparcians/stf_tools || exit 1
-RUN git clone https://github.com/riscv-software-src/riscv-pk.git || exit 1
-RUN git clone https://github.com/riscv-collab/riscv-gnu-toolchain.git || exit 1
+RUN git clone https://github.com/condorcomputing/condor.riscv-isa-sim.git --recurse-submodules
+RUN git clone https://github.com/sparcians/stf_tools
+RUN git clone https://github.com/riscv-software-src/riscv-pk.git
+RUN git clone https://gitlab.com/ribeiro.v.silva/trace-gen.git
 
-# Build riscv-gnu-toolchain
-WORKDIR $RISCV/riscv-gnu-toolchain
-RUN ./configure --prefix=/opt/riscv && make -j$(nproc) && make install
+# Clone QEMU and SimPoint
+WORKDIR /
+RUN git clone https://gitlab.com/qemu-project/qemu.git && \
+    git clone https://github.com/hanhwi/SimPoint.git
 
-# Build riscv-pk
-WORKDIR $RISCV/riscv-pk/build
-RUN ../configure --prefix=$RISCV --host=riscv64-unknown-elf && make -j$(nproc) && make install
+# Clone workloads with Embench PR
+WORKDIR /workloads
+RUN git clone https://github.com/riscv-software-src/riscv-tests.git && \
+    git clone -b spike-as-board https://github.com/widlarizer/embench-iot.git
+
+# Copy and execute toolchain setup script
+COPY utils/get-tool.sh $RISCV/get-tool.sh
+RUN chmod +x $RISCV/get-tool.sh && \
+    $RISCV/get-tool.sh && \
+    echo "Toolchain version:" && \
+    riscv64-unknown-linux-gnu-gcc --version 2>/dev/null || echo "Toolchain setup pending"
+
+# Build QEMU with plugins support
+WORKDIR /qemu/build
+RUN ../configure \
+    --target-list=riscv32-linux-user,riscv64-linux-user,riscv32-softmmu,riscv64-softmmu \
+    --enable-plugins \
+    --disable-docs \
+    --disable-gtk \
+    --disable-sdl 
+RUN make -j$(nproc)
+RUN make install
+
+# Build SimPoint
+WORKDIR /SimPoint
+RUN make -j$(nproc)
 
 # Build stf_tools
 WORKDIR $RISCV/stf_tools
-RUN git submodule update --init --recursive || exit 1
+RUN git submodule update --init --recursive
 WORKDIR $RISCV/stf_tools/release
 RUN cmake .. -DCMAKE_BUILD_TYPE=Release && make -j$(nproc)
 
-# Build condor.riscv-isa-sim
-WORKDIR $RISCV/condor.riscv-isa-sim
-RUN bash scripts/download-bm-compiler.sh && \
-    COMPILER_DIR=$(find . -maxdepth 1 -type d -name "riscv-embecosm-*" | head -n 1) && \
-    [ -n "$COMPILER_DIR" ] || (echo "Error: riscv-embecosm-* directory not found!" && exit 1) && \
-    export PATH=$(pwd)/$COMPILER_DIR/bin:$PATH && \
-    echo "export PATH=/riscv/condor.riscv-isa-sim/$COMPILER_DIR/bin:\$PATH" >> /root/.bashrc
-        
-RUN mkdir -p build && cd build && \
-    ../configure --prefix=$RISCV/condor.riscv-isa-sim/install && \
-    make -j$(nproc) && \
-    make regress && \
-    make install
+# Build condor.riscv-isa-sim (Spike)
+# make the builddir ? 
+WORKDIR $RISCV/condor.riscv-isa-sim/build
+RUN ../configure --prefix=$RISCV/condor.riscv-isa-sim/install 
+RUN make -j$(nproc) 
+RUN make regress 
+RUN make install
+ENV STF_DIR=$RISCV/condor.riscv-isa-sim/stf_lib
 
-# shell
+# Create mount points for runtime mounting
+# Environment and flow scripts will be mounted at runtime
+RUN mkdir -p /workloads/environment /flow /outputs
+
+# Note: The following are mounted at runtime:
+# - Host flow scripts -> /flow
+# - Host environment -> /workloads/environment  
+# - Host outputs -> /outputs
+
+RUN cp $RISCV/condor.riscv-isa-sim/install/bin/spike /usr/bin/
+
+WORKDIR $RISCV/trace-gen
+RUN make 
+RUN make install
+
+WORKDIR $RISCV/riscv-pk/build
+RUN mkdir $RISCV/pk
+RUN ../configure --prefix=$RISCV/pk --host=riscv64-unknown-elf
+RUN make -j$(nproc)
+RUN make install
+ENV PATH=$RISCV/pk:$PATH 
+
+WORKDIR /workspace 
+
 CMD ["/bin/bash"]
